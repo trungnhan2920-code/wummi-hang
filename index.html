@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WUMMI | Discord Voice Hang</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎧</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700;800&family=Orbitron:wght@500;700;900&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<canvas id="bg"></canvas>
+<div class="orb orb-1"></div>
+<div class="orb orb-2"></div>
+<div class="orb orb-3"></div>
+
+<!-- ================= LOGIN ================= -->
+<div id="view-login" class="view active">
+  <div class="hero">
+    <div class="badge"><span class="pulse-dot"></span>SELFBOT &bull; DISCORD VOICE HANG</div>
+    <h1 class="title">WUMMI<span class="grad">HANGER</span></h1>
+    <p class="subtitle">Dán token Discord của bạn &mdash; treo voice 24/7, đóng web vẫn giữ kết nối</p>
+
+    <div class="login-card glass">
+      <label class="field-label" for="token-input">DISCORD TOKEN</label>
+      <div class="input-row">
+        <input id="token-input" type="password" placeholder="Nhập token Discord..." autocomplete="off" spellcheck="false">
+        <button id="btn-login" class="btn-primary">Kết nối <span class="btn-arrow">&rarr;</span></button>
+      </div>
+      <div id="login-msg" class="msg"></div>
+      <div class="login-meta">
+        <span class="mini-dot"></span> Máy chủ luôn bật &bull; Kết nối được giữ kể cả khi tắt web
+      </div>
+    </div>
+
+    <div class="clock-card glass">
+      <div class="clock-label">SERVER TIME</div>
+      <div id="clock" class="clock">00:00:00</div>
+      <div id="date" class="date"></div>
+    </div>
+  </div>
+  <footer class="foot">Powered by <b>PhLong</b> &bull; wummi.site.je</footer>
+</div>
+
+<!-- ================= DASHBOARD ================= -->
+<div id="view-dash" class="view">
+  <header class="topbar glass">
+    <div class="brand">WUMMI<span class="grad">HANGER</span></div>
+    <div id="user-chip" class="user-chip"></div>
+    <button id="btn-logout" class="btn-ghost">Đăng xuất</button>
+  </header>
+
+  <main class="dash">
+    <aside class="panel glass guild-panel">
+      <div class="panel-head"><h3>SERVERS</h3><span id="guild-count" class="count">0</span></div>
+      <div id="guild-list" class="list"></div>
+    </aside>
+
+    <section class="panel glass chan-panel">
+      <div class="panel-head"><h3 id="chan-title">CHỌN SERVER</h3></div>
+      <div id="channel-list" class="list"></div>
+    </section>
+
+    <aside class="panel glass hang-panel">
+      <div class="panel-head"><h3>VOICE HANG</h3></div>
+      <div class="hang-box">
+        <div id="hang-status" class="hang-status idle">Chưa treo kênh nào</div>
+        <div id="hang-channel" class="hang-channel"></div>
+        <div class="timer-box">
+          <div id="timer" class="timer">00:00:00</div>
+          <div class="timer-label">THỜI GIAN TREO</div>
+        </div>
+        <button id="btn-stop" class="btn-danger hidden">Ngừng treo voice</button>
+      </div>
+      <div class="hang-note">Kết nối chạy trên máy chủ &mdash; bạn có thể đóng web, voice vẫn được giữ.</div>
+    </aside>
+  </main>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const $$ = (s) => document.querySelectorAll(s);
+const shown = (el) => el.classList.remove("hidden");
+const hidden = (el) => el.classList.add("hidden");
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+let TOKEN = localStorage.getItem("wummi_token") || "";
+let USER = null;
+let GUILDS = [];
+let ACTIVE_GUILD = null;
+let HANG = null;
+let TIMER_INT = null;
+
+async function api(path, method = "GET", body = null) {
+  const res = await fetch(path, {
+    method,
+    headers: { "Content-Type": "application/json", "X-Token": TOKEN },
+    body: body ? JSON.stringify(body) : null,
+  });
+  return res.json();
+}
+
+function toast(msg, type = "ok") {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.className = "toast show " + type;
+  clearTimeout(t._h);
+  t._h = setTimeout(() => t.classList.remove("show"), 3200);
+}
+
+function iconUrl(g) {
+  return g.icon ? `https://cdn.discordapp.com/icons/${g.id}/${g.icon}.png?size=128` : null;
+}
+
+function avatarUrl(u) {
+  return u && u.avatar ? `https://cdn.discordapp.com/avatars/${u.id}/${u.avatar}.png?size=64` : null;
+}
+
+function showView(name) {
+  $$(".view").forEach((v) => v.classList.remove("active"));
+  $("#view-" + name).classList.add("active");
+}
+
+function showMsg(text, isErr) {
+  const m = $("#login-msg");
+  m.textContent = text;
+  m.className = "msg " + (isErr ? "err" : "ok");
+}
+
+function startTimer() {
+  clearInterval(TIMER_INT);
+  const tick = () => {
+    const s = Math.max(0, Math.floor((Date.now() - HANG.started_at * 1000) / 1000));
+    const h = String(Math.floor(s / 3600)).padStart(2, "0");
+    const m = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
+    const sec = String(s % 60).padStart(2, "0");
+    $("#timer").textContent = `${h}:${m}:${sec}`;
+  };
+  tick();
+  TIMER_INT = setInterval(tick, 1000);
+}
+
+async function doLogin() {
+  const token = $("#token-input").value.trim();
+  if (!token) return toast("Vui lòng nhập token", "err");
+  const btn = $("#btn-login");
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Đang kết nối...';
+  showMsg("", false);
+  const r = await api("/api/login", "POST", { token });
+  btn.disabled = false;
+  btn.innerHTML = 'Kết nối <span class="btn-arrow">&rarr;</span>';
+  if (!r.ok) {
+    showMsg(r.error || "Đăng nhập thất bại", true);
+    return;
+  }
+  TOKEN = token;
+  localStorage.setItem("wummi_token", token);
+  USER = r.user;
+  await loadDashboard();
+}
+
+async function loadDashboard() {
+  const r = await api("/api/guilds");
+  if (!r.ok) return logout();
+  GUILDS = r.guilds;
+
+  const av = avatarUrl(USER);
+  $("#user-chip").innerHTML = av
+    ? `<img class="avatar" src="${av}"><div class="uinfo"><b>${esc(USER.username)}</b><span>${USER.id}</span></div>`
+    : `<div class="avatar ph">${esc((USER.username || "?").charAt(0).toUpperCase())}</div><div class="uinfo"><b>${esc(USER.username)}</b><span>${USER.id}</span></div>`;
+
+  renderGuilds();
+
+  const st = await api("/api/status");
+  if (st.ok && st.hang) {
+    HANG = st.hang;
+    startTimer();
+    $("#hang-status").className = "hang-status live";
+    $("#hang-status").textContent = "ĐANG TREO VOICE";
+    $("#hang-channel").textContent = `${st.hang.guild_name} / ${st.hang.channel_name}`;
+    shown($("#btn-stop"));
+    toast("Đã nối lại phiên treo voice", "ok");
+  }
+  showView("dash");
+}
+
+function renderGuilds() {
+  $("#guild-count").textContent = GUILDS.length;
+  const list = $("#guild-list");
+  list.innerHTML = "";
+  if (!GUILDS.length) {
+    list.innerHTML = '<div class="empty">Không có server nào</div>';
+    return;
+  }
+  for (const g of GUILDS) {
+    const item = document.createElement("div");
+    item.className = "guild-item" + (ACTIVE_GUILD === g.id ? " active" : "");
+    const img = iconUrl(g);
+    item.innerHTML = img
+      ? `<img class="g-icon" src="${img}" onerror="this.remove()"><div class="g-meta"><b>${esc(g.name)}</b><span>${g.id}</span></div>`
+      : `<div class="g-icon ph">${esc((g.name || "?").charAt(0).toUpperCase())}</div><div class="g-meta"><b>${esc(g.name)}</b><span>${g.id}</span></div>`;
+    item.addEventListener("click", () => selectGuild(g.id));
+    list.appendChild(item);
+  }
+}
+
+async function selectGuild(gid) {
+  ACTIVE_GUILD = gid;
+  renderGuilds();
+  const g = GUILDS.find((x) => x.id === gid);
+  $("#chan-title").innerHTML = `&Sigma; ${esc(g.name)}`;
+  const box = $("#channel-list");
+  box.innerHTML = '<div class="empty"><span class="spinner"></span> Đang tải kênh...</div>';
+  const r = await api(`/api/guilds/${gid}/channels`);
+  if (!r.ok) {
+    box.innerHTML = `<div class="empty">${esc(r.error || "Lỗi")}</div>`;
+    return;
+  }
+  box.innerHTML = "";
+  if (!r.channels.length) {
+    box.innerHTML = '<div class="empty">Server này không có kênh voice</div>';
+    return;
+  }
+  for (const c of r.channels) {
+    const item = document.createElement("div");
+    item.className = "chan-item";
+    const isActive = HANG && HANG.channel_id === c.id;
+    item.innerHTML = `
+      <div class="c-icon">&#128266;</div>
+      <div class="c-meta"><b>${esc(c.name)}</b><span>Kênh voice</span></div>
+      <button class="btn-join${isActive ? " active" : ""}">${isActive ? "&#10003; Đang treo" : "Treo voice"}</button>`;
+    if (!isActive) {
+      const btn = item.querySelector(".btn-join");
+      btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        btn.textContent = "Đang treo...";
+        const rr = await api("/api/hang", "POST", {
+          guild_id: gid,
+          channel_id: c.id,
+          guild_name: g.name,
+          channel_name: c.name,
+        });
+        btn.disabled = false;
+        if (!rr.ok) {
+          btn.textContent = "Treo voice";
+          return toast(rr.error || "Không thể treo voice", "err");
+        }
+        HANG = { started_at: rr.started_at, channel_id: c.id, channel_name: c.name, guild_name: g.name };
+        startTimer();
+        $("#hang-status").className = "hang-status live";
+        $("#hang-status").textContent = "ĐANG TREO VOICE";
+        $("#hang-channel").textContent = `${g.name} / ${c.name}`;
+        shown($("#btn-stop"));
+        toast(`Đã treo voice vào ${c.name}`, "ok");
+        selectGuild(gid);
+      });
+    }
+    box.appendChild(item);
+  }
+}
+
+async function stopHang() {
+  await api("/api/stop", "POST", {});
+  HANG = null;
+  clearInterval(TIMER_INT);
+  $("#timer").textContent = "00:00:00";
+  $("#hang-status").className = "hang-status idle";
+  $("#hang-status").textContent = "Đã ngừng treo";
+  $("#hang-channel").textContent = "";
+  hidden($("#btn-stop"));
+  toast("Đã ngừng treo voice", "ok");
+  selectGuild(ACTIVE_GUILD);
+}
+
+async function logout() {
+  await api("/api/logout", "POST", {});
+  localStorage.removeItem("wummi_token");
+  location.reload();
+}
+
+function tickClock() {
+  const d = new Date();
+  $("#clock").textContent = [d.getHours(), d.getMinutes(), d.getSeconds()].map((x) => String(x).padStart(2, "0")).join(":");
+  $("#date").textContent = d.toLocaleDateString("vi-VN", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+}
+
+const cv = $("#bg");
+const ctx = cv.getContext("2d");
+let P = [];
+function resize() { cv.width = innerWidth; cv.height = innerHeight; }
+function mkP() {
+  return { x: Math.random() * cv.width, y: Math.random() * cv.height, r: Math.random() * 2.2 + 0.4, v: Math.random() * 0.35 + 0.1, a: Math.random() * 0.5 + 0.15, tw: Math.random() * Math.PI * 2 };
+}
+function anim() {
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  for (const p of P) {
+    p.y -= p.v;
+    p.tw += 0.02;
+    if (p.y < -5) { Object.assign(p, mkP()); p.y = cv.height + 5; }
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r, 0, 7);
+    ctx.fillStyle = `rgba(167,139,250,${p.a * (0.6 + 0.4 * Math.sin(p.tw))})`;
+    ctx.fill();
+  }
+  requestAnimationFrame(anim);
+}
+
+(async function init() {
+  tickClock();
+  setInterval(tickClock, 1000);
+  addEventListener("resize", () => { resize(); P = Array.from({ length: 90 }, mkP); });
+  resize();
+  P = Array.from({ length: 90 }, mkP);
+  anim();
+
+  $("#btn-login").addEventListener("click", doLogin);
+  $("#token-input").addEventListener("keydown", (e) => { if (e.key === "Enter") doLogin(); });
+  $("#btn-logout").addEventListener("click", logout);
+  $("#btn-stop").addEventListener("click", stopHang);
+
+  if (TOKEN) {
+    const st = await api("/api/status");
+    if (st.ok && st.user) {
+      USER = st.user;
+      await loadDashboard();
+    } else {
+      localStorage.removeItem("wummi_token");
+    }
+  }
+})();
+</script>
+</body>
+</html>
