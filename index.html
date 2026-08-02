@@ -77,6 +77,23 @@
       </div>
       <div class="hang-note">Kết nối chạy trên máy chủ &mdash; bạn có thể đóng web, voice vẫn được giữ.</div>
     </aside>
+
+    <section class="panel glass quest-panel">
+      <div class="panel-head">
+        <h3>AUTO QUEST <span id="quest-count" class="count">0</span></h3>
+        <div class="quest-actions">
+          <label class="switch"><input type="checkbox" id="quest-auto-accept" checked><span>Auto nhận quest</span></label>
+          <button id="btn-quest-toggle" class="btn-join">Bật Auto Quest</button>
+        </div>
+      </div>
+      <div id="quest-list" class="quest-list"></div>
+      <div class="quest-log-head">
+        <h3>NHẬT KÝ</h3>
+        <span id="quest-running" class="qstate idle">ĐANG TẮT</span>
+      </div>
+      <div id="quest-log" class="quest-log">Chưa có nhật ký. Bật Auto Quest để bắt đầu.</div>
+      <div class="hang-note">Tự nhận quest và hoàn thành (xem video / chơi game / activity). Quest STREAM_ON_DESKTOP cần app desktop. Không nên chạy khi đang online trên thiết bị khác.</div>
+    </section>
   </main>
 </div>
 
@@ -187,6 +204,9 @@ async function loadDashboard() {
     shown($("#btn-stop"));
     toast("Đã nối lại phiên treo voice", "ok");
   }
+  refreshQuests();
+  clearInterval(QUEST_POLL);
+  QUEST_POLL = setInterval(refreshQuests, 5000);
   showView("dash");
 }
 
@@ -278,8 +298,81 @@ async function stopHang() {
   selectGuild(ACTIVE_GUILD);
 }
 
+let QUEST_POLL = null;
+
+const TASK_LABEL = {
+  WATCH_VIDEO: "XEM VIDEO",
+  WATCH_VIDEO_ON_MOBILE: "XEM VIDEO MOBILE",
+  PLAY_ON_DESKTOP: "CHƠI GAME",
+  PLAY_ACTIVITY: "ACTIVITY",
+  STREAM_ON_DESKTOP: "STREAM",
+};
+
+async function refreshQuests() {
+  let r, s;
+  try {
+    [r, s] = await Promise.all([api("/api/quests"), api("/api/quests/status")]);
+  } catch (e) {
+    return;
+  }
+  if (!r.ok || !s.ok) return;
+  renderQuestToggle(!!r.running, s.auto_accept);
+  renderQuestList(r.quests || []);
+  renderQuestLog(s.logs || []);
+}
+
+function renderQuestToggle(running, autoAccept) {
+  $("#quest-auto-accept").checked = autoAccept !== false;
+  const btn = $("#btn-quest-toggle");
+  btn.textContent = running ? "Tắt Auto Quest" : "Bật Auto Quest";
+  btn.classList.toggle("active", running);
+  btn.disabled = false;
+  const qr = $("#quest-running");
+  qr.textContent = running ? "ĐANG CHẠY" : "ĐANG TẮT";
+  qr.className = "qstate " + (running ? "run" : "idle");
+}
+
+function renderQuestList(quests) {
+  const box = $("#quest-list");
+  $("#quest-count").textContent = quests.length;
+  if (!quests.length) {
+    box.innerHTML = '<div class="empty">Không có quest nào đang hoạt động</div>';
+    return;
+  }
+  box.innerHTML = "";
+  for (const q of quests) {
+    const el = document.createElement("div");
+    el.className = "quest-item";
+    const pct = q.target > 0 ? Math.min(100, Math.round((q.value / q.target) * 100)) : 0;
+    const st = q.completed
+      ? ["done", "HOÀN THÀNH"]
+      : q.enrolled
+      ? ["run", "ĐANG CHẠY"]
+      : ["idle", "CHƯA NHẬN"];
+    el.innerHTML = `
+      <div class="q-info"><b class="q-name">${esc(q.name)}</b><span class="q-app">${esc(q.app)}</span></div>
+      <span class="q-badge">${TASK_LABEL[q.task] || esc(q.task || "?")}</span>
+      <div class="q-bar"><div class="q-fill" style="width:${pct}%"></div></div>
+      <div class="q-prog">${q.target ? Math.min(q.value, q.target) + "/" + q.target + "s" : ""}</div>
+      <span class="q-status ${st[0]}">${st[1]}</span>`;
+    box.appendChild(el);
+  }
+}
+
+function renderQuestLog(logs) {
+  const el = $("#quest-log");
+  if (!logs.length) {
+    el.textContent = "Chưa có nhật ký. Bật Auto Quest để bắt đầu.";
+    return;
+  }
+  const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+  el.textContent = logs.slice(-150).join("\n");
+  if (nearBottom) el.scrollTop = el.scrollHeight;
+}
+
 async function logout() {
   await api("/api/logout", "POST", {});
+  clearInterval(QUEST_POLL);
   localStorage.removeItem("wummi_token");
   location.reload();
 }
@@ -323,6 +416,20 @@ function anim() {
   $("#token-input").addEventListener("keydown", (e) => { if (e.key === "Enter") doLogin(); });
   $("#btn-logout").addEventListener("click", logout);
   $("#btn-stop").addEventListener("click", stopHang);
+  $("#btn-quest-toggle").addEventListener("click", async () => {
+    const btn = $("#btn-quest-toggle");
+    btn.disabled = true;
+    const running = btn.classList.contains("active");
+    const r = await api(running ? "/api/quests/stop" : "/api/quests/start", "POST", {
+      auto_accept: $("#quest-auto-accept").checked,
+    });
+    if (!r.ok) {
+      btn.disabled = false;
+      return toast(r.error || "Thao tác thất bại", "err");
+    }
+    toast(running ? "Đã tắt Auto Quest" : "Đã bật Auto Quest", "ok");
+    refreshQuests();
+  });
 
   if (TOKEN) {
     const st = await api("/api/status");
