@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 state.json
 sessions.json
+quest_state.json

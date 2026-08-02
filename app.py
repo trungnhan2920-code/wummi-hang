@@ -3,9 +3,9 @@ import base64
 import json
 import os
 import random
+import re
 import threading
 import time
-import uuid
 from collections import deque
 from datetime import datetime
 
@@ -75,35 +75,66 @@ QUEST_STATE_FILE = os.path.join(BASE, "quest_state.json")
 QUEST_TASKS = ("WATCH_VIDEO", "PLAY_ON_DESKTOP", "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE", "STREAM_ON_DESKTOP")
 DISCORD_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) discord/1.0.9236 Chrome/138.0.7204.251 "
-    "Electron/37.6.0 Safari/537.36"
+    "(KHTML, like Gecko) discord/1.0.9175 Chrome/128.0.6613.186 "
+    "Electron/32.2.7 Safari/537.36"
 )
+DEFAULT_BUILD_NUMBER = 504649
+_build_number = None
 quest_workers = {}
 
 
-def quest_headers(token):
+def fetch_latest_build_number():
+    global _build_number
+    if _build_number is not None:
+        return _build_number
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    try:
+        r = requests.get("https://discord.com/app", headers={"User-Agent": ua}, timeout=15)
+        if r.status_code == 200:
+            assets = re.findall(r'/assets/([a-f0-9]+)\.js', r.text)
+            if not assets:
+                assets = [
+                    a.split("/")[-1].replace(".js", "") or a.split("/")[-1]
+                    for a in re.findall(r'src="(/assets/[^"]+\.js)"', r.text)
+                ]
+            for asset in assets[-5:]:
+                try:
+                    ar = requests.get(
+                        f"https://discord.com/assets/{asset}.js",
+                        headers={"User-Agent": ua},
+                        timeout=15,
+                    )
+                    m = re.search(r'buildNumber["\s:]+["\s]*(\d{5,7})', ar.text)
+                    if m:
+                        _build_number = int(m.group(1))
+                        return _build_number
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    _build_number = DEFAULT_BUILD_NUMBER
+    return _build_number
+
+
+def make_quest_session(token):
+    build = fetch_latest_build_number()
     props = {
         "os": "Windows",
         "browser": "Discord Client",
         "release_channel": "stable",
-        "client_version": "1.0.9236",
-        "os_version": "10.0.19045",
+        "client_version": "1.0.9175",
+        "os_version": "10.0.26100",
         "os_arch": "x64",
         "app_arch": "x64",
         "system_locale": "en-US",
-        "has_client_mods": False,
-        "client_launch_id": str(uuid.uuid4()),
         "browser_user_agent": DISCORD_UA,
-        "browser_version": "37.6.0",
-        "os_sdk_version": "19045",
-        "client_build_number": 539951,
-        "native_build_number": 81687,
+        "browser_version": "32.2.7",
+        "client_build_number": build,
+        "native_build_number": 59498,
         "client_event_source": None,
-        "launch_signature": str(uuid.uuid4()),
-        "client_heartbeat_session_id": str(uuid.uuid4()),
-        "client_app_state": "focused",
     }
-    return {
+    s = requests.Session()
+    s.headers.update({
         "Authorization": token,
         "User-Agent": DISCORD_UA,
         "Origin": "https://discord.com",
@@ -111,11 +142,12 @@ def quest_headers(token):
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
         "Content-Type": "application/json",
-        "x-super-properties": base64.b64encode(json.dumps(props).encode()).decode(),
-        "x-discord-locale": "en-US",
-        "x-discord-timezone": "Asia/Saigon",
-        "x-debug-options": "bugReporterEnabled",
-    }
+        "X-Super-Properties": base64.b64encode(json.dumps(props).encode()).decode(),
+        "X-Discord-Locale": "en-US",
+        "X-Discord-Timezone": "Asia/Ho_Chi_Minh",
+        "X-Debug-Options": "bugReporterEnabled",
+    })
+    return s
 
 
 def iso_ms(value):
@@ -142,6 +174,7 @@ class QuestWorker:
         self.tasks = {}
         self.started_at = time.time()
         self.thread = None
+        self.session = None
 
     def log(self, msg):
         with self.lock:
@@ -187,13 +220,16 @@ class QuestWorker:
 
     @staticmethod
     def _user_status(quest):
-        return quest.get("user_status") or {}
+        us = quest.get("user_status")
+        if not isinstance(us, dict):
+            us = quest.get("userStatus")
+        return us if isinstance(us, dict) else {}
 
     def _enrolled(self, quest):
-        return bool(self._user_status(quest).get("enrolled_at"))
+        return bool(self._user_status(quest).get("enrolled_at") or self._user_status(quest).get("enrolledAt"))
 
     def _completed(self, quest):
-        return bool(self._user_status(quest).get("completed_at"))
+        return bool(self._user_status(quest).get("completed_at") or self._user_status(quest).get("completedAt"))
 
     def _completable(self, quest):
         cfg = quest.get("config") or {}
@@ -220,18 +256,21 @@ class QuestWorker:
             return 0
 
     # ---------- HTTP ----------
+    def _ensure_session(self):
+        if self.session is None:
+            self.session = make_quest_session(self.token)
+        return self.session
+
     def _post(self, path, body):
-        return requests.post(
+        return self._ensure_session().post(
             "https://discord.com/api/v9" + path,
-            headers=quest_headers(self.token),
             json=body,
             timeout=30,
         )
 
     def _get(self, path):
-        return requests.get(
+        return self._ensure_session().get(
             "https://discord.com/api/v9" + path,
-            headers=quest_headers(self.token),
             timeout=30,
         )
 
@@ -251,7 +290,17 @@ class QuestWorker:
         self.log("[Auto Quest] Đã dừng")
 
     def _tick(self, first):
-        r = self._get("/quests/@me")
+        for attempt in (1, 2):
+            r = self._get("/quests/@me")
+            if r.status_code == 429:
+                try:
+                    wait = float(r.json().get("retry_after", 10)) + 1
+                except Exception:
+                    wait = 11
+                self.log(f"[Auto Quest] Rate limited – chờ {int(wait)}s...")
+                self.stop_event.wait(wait)
+                continue
+            break
         if r.status_code == 401:
             self.log("[Auto Quest] Token hết hạn, dừng worker")
             self.stop_event.set()
@@ -333,15 +382,10 @@ class QuestWorker:
             task = tasks[task_name]
             if task_name in ("WATCH_VIDEO", "WATCH_VIDEO_ON_MOBILE"):
                 self._run_video(quest, task_name, task)
-            elif task_name == "PLAY_ON_DESKTOP":
-                self._run_play(quest, task_name, task)
+            elif task_name in ("PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP"):
+                self._run_heartbeat(quest, task_name, task)
             elif task_name == "PLAY_ACTIVITY":
                 self._run_activity(quest, task_name, task)
-            else:
-                self.log(
-                    f"Bỏ qua \"{self._quest_name(quest)}\": STREAM_ON_DESKTOP "
-                    "chỉ chạy được trên app Discord desktop (stream thật + ít nhất 1 người xem)"
-                )
         except Exception as e:
             self.log(f"Lỗi xử lý quest \"{self._quest_name(quest)}\": {e}")
         finally:
@@ -354,7 +398,7 @@ class QuestWorker:
         needed = int(task.get("target") or 0)
         us = self._user_status(quest)
         done = self._progress(us, task_name, quest)
-        enrolled_ms = iso_ms(us.get("enrolled_at"))
+        enrolled_ms = iso_ms(us.get("enrolled_at") or us.get("enrolledAt"))
         try:
             self.log(f"[Video] {name}: {min(done, needed)}/{needed}s")
             while not self.stop_event.is_set():
@@ -388,46 +432,17 @@ class QuestWorker:
         except Exception as e:
             self.log(f"Lỗi video \"{name}\": {e}")
 
-    def _run_play(self, quest, task_name, task):
+    def _run_heartbeat(self, quest, task_name, task):
         name = self._quest_name(quest)
         qid = quest["id"]
         needed = int(task.get("target") or 0)
-        app_id = (quest.get("config") or {}).get("application", {}).get("id")
-        self.log(f"[Game] {name}: giả lập chơi game trên desktop...")
-        while not self.stop_event.is_set():
-            try:
-                r = self._post(f"/quests/{qid}/heartbeat", {
-                    "application_id": app_id, "terminal": False
-                })
-                try:
-                    body = r.json()
-                except Exception:
-                    body = {}
-                if r.status_code == 429:
-                    self.stop_event.wait(30)
-                    continue
-                if r.status_code >= 400:
-                    self.log(f"[{name}] Lỗi heartbeat (HTTP {r.status_code}): {str(body.get('message', r.text[:150]))}")
-                    return
-                prog = self._progress(body, task_name, quest)
-                self.log(f"[{name}] Tiến độ: {prog}/{needed}s")
-                if prog >= needed:
-                    self._post(f"/quests/{qid}/heartbeat", {
-                        "application_id": app_id, "terminal": True
-                    })
-                    self.log(f"Hoàn thành: {name}")
-                    return
-            except Exception as e:
-                self.log(f"Lỗi heartbeat \"{name}\": {e}")
-                return
-            self.stop_event.wait(20)
-
-    def _run_activity(self, quest, task_name, task):
-        name = self._quest_name(quest)
-        qid = quest["id"]
-        needed = int(task.get("target") or 0)
-        stream_key = f"call:{qid}:1"
-        self.log(f"[Activity] {name}: gửi heartbeat...")
+        pid = random.randint(1000, 30000)
+        stream_key = f"call:0:{pid}"
+        us = self._user_status(quest)
+        done = self._progress(us, task_name, quest)
+        remaining = max(0, needed - done)
+        self.log(f"[{task_name}] {name}: giả lập (còn ~{remaining // 60} phút)")
+        fails = 0
         while not self.stop_event.is_set():
             try:
                 r = self._post(f"/quests/{qid}/heartbeat", {
@@ -438,28 +453,92 @@ class QuestWorker:
                 except Exception:
                     body = {}
                 if r.status_code == 429:
-                    self.stop_event.wait(30)
+                    try:
+                        wait = float(body.get("retry_after", 10)) + 1
+                    except Exception:
+                        wait = 11
+                    self.log(f"[{name}] Rate limited – chờ {int(wait)}s...")
+                    self.stop_event.wait(wait)
                     continue
                 if r.status_code >= 400:
+                    fails += 1
                     self.log(f"[{name}] Lỗi heartbeat (HTTP {r.status_code}): {str(body.get('message', r.text[:150]))}")
-                    return
+                    if fails >= 5:
+                        self.log(f"[{name}] Bỏ sau 5 lần lỗi liên tiếp")
+                        return
+                    self.stop_event.wait(20)
+                    continue
+                fails = 0
                 prog = self._progress(body, task_name, quest)
                 self.log(f"[{name}] Tiến độ: {prog}/{needed}s")
-                if prog >= needed:
+                if body.get("completed_at") or prog >= needed:
                     self._post(f"/quests/{qid}/heartbeat", {
                         "stream_key": stream_key, "terminal": True
                     })
                     self.log(f"Hoàn thành: {name}")
                     return
             except Exception as e:
+                fails += 1
                 self.log(f"Lỗi heartbeat \"{name}\": {e}")
-                return
+                if fails >= 5:
+                    return
+            self.stop_event.wait(20)
+
+    def _run_activity(self, quest, task_name, task):
+        name = self._quest_name(quest)
+        qid = quest["id"]
+        needed = int(task.get("target") or 0)
+        stream_key = "call:0:1"
+        us = self._user_status(quest)
+        done = self._progress(us, task_name, quest)
+        remaining = max(0, needed - done)
+        self.log(f"[Activity] {name}: gửi heartbeat (còn ~{remaining // 60} phút)")
+        fails = 0
+        while not self.stop_event.is_set():
+            try:
+                r = self._post(f"/quests/{qid}/heartbeat", {
+                    "stream_key": stream_key, "terminal": False
+                })
+                try:
+                    body = r.json()
+                except Exception:
+                    body = {}
+                if r.status_code == 429:
+                    try:
+                        wait = float(body.get("retry_after", 10)) + 1
+                    except Exception:
+                        wait = 11
+                    self.log(f"[{name}] Rate limited – chờ {int(wait)}s...")
+                    self.stop_event.wait(wait)
+                    continue
+                if r.status_code >= 400:
+                    fails += 1
+                    self.log(f"[{name}] Lỗi heartbeat (HTTP {r.status_code}): {str(body.get('message', r.text[:150]))}")
+                    if fails >= 5:
+                        self.log(f"[{name}] Bỏ sau 5 lần lỗi liên tiếp")
+                        return
+                    self.stop_event.wait(20)
+                    continue
+                fails = 0
+                prog = self._progress(body, task_name, quest)
+                self.log(f"[{name}] Tiến độ: {prog}/{needed}s")
+                if body.get("completed_at") or prog >= needed:
+                    self._post(f"/quests/{qid}/heartbeat", {
+                        "stream_key": stream_key, "terminal": True
+                    })
+                    self.log(f"Hoàn thành: {name}")
+                    return
+            except Exception as e:
+                fails += 1
+                self.log(f"Lỗi heartbeat \"{name}\": {e}")
+                if fails >= 5:
+                    return
             self.stop_event.wait(20)
 
 
 def summarize_quest(q):
     cfg = q.get("config") or {}
-    us = q.get("user_status") or {}
+    us = QuestWorker._user_status(q)
     tasks = QuestWorker._task_config(q).get("tasks") or {}
     task_name = next((t for t in QUEST_TASKS if t in tasks), None)
     target, value = 0, 0
@@ -481,9 +560,9 @@ def summarize_quest(q):
         "task": task_name,
         "target": target,
         "value": value,
-        "enrolled": bool(us.get("enrolled_at")),
-        "completed": bool(us.get("completed_at")),
-        "expires_at": cfg.get("expires_at"),
+        "enrolled": bool(us.get("enrolled_at") or us.get("enrolledAt")),
+        "completed": bool(us.get("completed_at") or us.get("completedAt")),
+        "expires_at": cfg.get("expires_at") or cfg.get("expiresAt"),
     }
 
 
@@ -739,9 +818,8 @@ def api_quests():
     quests = w.get_quests() if w else None
     if quests is None:
         try:
-            r = requests.get(
+            r = make_quest_session(token).get(
                 "https://discord.com/api/v9/quests/@me",
-                headers=quest_headers(token),
                 timeout=20,
             )
             if r.status_code == 200:
