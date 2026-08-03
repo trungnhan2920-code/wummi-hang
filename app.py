@@ -72,7 +72,11 @@ def dapi(method, path, token, **kw):
 
 # ================= AUTO QUEST DISCORD =================
 QUEST_STATE_FILE = os.path.join(BASE, "quest_state.json")
-QUEST_TASKS = ("WATCH_VIDEO", "PLAY_ON_DESKTOP", "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE", "STREAM_ON_DESKTOP")
+QUEST_TASKS = ("WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE")
+VIDEO_SPEED = 7          # giây nhảy mỗi lần báo tiến độ video
+VIDEO_INTERVAL = 1       # giây giữa các lần báo
+VIDEO_MAX_FUTURE = 10    # giới hạn "tương lai" so với thời gian thực
+HEARTBEAT_INTERVAL = 20  # giây giữa các heartbeat
 DISCORD_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) discord/1.0.9175 Chrome/128.0.6613.186 "
@@ -145,22 +149,8 @@ def make_quest_session(token):
         "X-Super-Properties": base64.b64encode(json.dumps(props).encode()).decode(),
         "X-Discord-Locale": "en-US",
         "X-Discord-Timezone": "Asia/Ho_Chi_Minh",
-        "X-Debug-Options": "bugReporterEnabled",
     })
     return s
-
-
-def iso_ms(value):
-    try:
-        s = (value or "").replace("Z", "+00:00")
-        if not s:
-            return 0
-        return int(datetime.fromisoformat(s).timestamp() * 1000)
-    except Exception:
-        try:
-            return int(time.mktime(time.strptime(value[:19], "%Y-%m-%dT%H:%M:%S")) * 1000)
-        except Exception:
-            return 0
 
 
 class QuestWorker:
@@ -172,6 +162,7 @@ class QuestWorker:
         self.logs = deque(maxlen=500)
         self.quests = []
         self.tasks = {}
+        self.progress = {}
         self.started_at = time.time()
         self.thread = None
         self.session = None
@@ -274,6 +265,10 @@ class QuestWorker:
             timeout=30,
         )
 
+    def _set_progress(self, qid, value, needed):
+        with self.lock:
+            self.progress[qid] = {"value": value, "needed": needed}
+
     # ---------- main loop ----------
     def _run(self):
         self.log(f"[Auto Quest] Bắt đầu (auto nhận: {'BẬT' if self.auto_accept else 'TẮT'})")
@@ -312,6 +307,12 @@ class QuestWorker:
         with self.lock:
             self.quests = quests
 
+        # Dọn progress của quest không còn xuất hiện
+        valid_ids = {q.get("id") for q in quests}
+        with self.lock:
+            for qid in [x for x in self.progress if x not in valid_ids]:
+                self.progress.pop(qid, None)
+
         if self.auto_accept:
             pending = [
                 q for q in quests
@@ -325,16 +326,20 @@ class QuestWorker:
                     self._enroll(q)
                     self.stop_event.wait(3)
 
+        new_threads = 0
         for q in quests:
             if self.stop_event.is_set():
                 return
-            if self._enrolled(q) and not self._completed(q):
+            if self._enrolled(q) and not self._completed(q) and self._completable(q):
                 qid = q.get("id")
                 with self.lock:
                     if qid not in self.tasks:
                         t = threading.Thread(target=self._handle_quest, args=(q,), daemon=True)
                         self.tasks[qid] = t
                         t.start()
+                        new_threads += 1
+        if new_threads:
+            self.log(f"Chạy song song {new_threads} quest mới (tất cả cùng lúc)")
 
     def _enroll(self, quest):
         name = self._quest_name(quest)
@@ -398,39 +403,61 @@ class QuestWorker:
         needed = int(task.get("target") or 0)
         us = self._user_status(quest)
         done = self._progress(us, task_name, quest)
-        enrolled_ms = iso_ms(us.get("enrolled_at") or us.get("enrolledAt"))
-        try:
-            self.log(f"[Video] {name}: {min(done, needed)}/{needed}s")
-            while not self.stop_event.is_set():
-                max_allowed = int((time.time() * 1000 - enrolled_ms) / 1000) + 10
-                ts = done + 7
-                if max_allowed - done >= 7:
+        enrolled_at_str = us.get("enrolled_at") or us.get("enrolledAt")
+        if enrolled_at_str:
+            try:
+                enrolled_ts = datetime.fromisoformat(str(enrolled_at_str).replace("Z", "+00:00")).timestamp()
+            except Exception:
+                enrolled_ts = time.time()
+        else:
+            enrolled_ts = time.time()
+
+        self.log(f"[Video] {name}: {min(done, needed):.0f}/{needed}s (chạy song song)")
+
+        while done < needed and not self.stop_event.is_set():
+            max_allowed = (time.time() - enrolled_ts) + VIDEO_MAX_FUTURE
+            diff = max_allowed - done
+            timestamp = done + VIDEO_SPEED
+
+            if diff >= VIDEO_SPEED:
+                try:
                     r = self._post(f"/quests/{qid}/video-progress", {
-                        "timestamp": min(needed, ts + random.random())
+                        "timestamp": min(needed, timestamp + random.random())
                     })
                     try:
                         body = r.json()
                     except Exception:
                         body = {}
-                    if r.status_code == 429:
-                        self.stop_event.wait(5)
+                    if r.status_code == 200:
+                        if body.get("completed_at"):
+                            self.log(f"Hoàn thành: {name}")
+                            return
+                        done = min(needed, timestamp)
+                        self._set_progress(qid, done, needed)
+                        self.log(f"[{name}] Tiến độ: {done:.0f}/{needed}s")
+                    elif r.status_code == 429:
+                        try:
+                            wait = float(body.get("retry_after", 5)) + 1
+                        except Exception:
+                            wait = 6
+                        self.log(f"[{name}] Rate limited – chờ {int(wait)}s...")
+                        self.stop_event.wait(wait)
                         continue
-                    if r.status_code >= 400:
-                        self.log(f"[{name}] Lỗi video-progress (HTTP {r.status_code}): {str(body.get('message', r.text[:150]))}")
-                        return
-                    done = min(needed, ts)
-                    if body.get("completed_at"):
-                        self.log(f"Hoàn thành: {name}")
-                        return
-                    self.log(f"[{name}] Tiến độ: {done}/{needed}s")
-                if ts >= needed:
-                    break
-                self.stop_event.wait(1)
-            if not self.stop_event.is_set():
+                    else:
+                        self.log(f"[{name}] Lỗi video-progress (HTTP {r.status_code}): {r.text[:150]}")
+                except Exception as e:
+                    self.log(f"Lỗi video \"{name}\": {e}")
+
+            if timestamp >= needed:
+                break
+            self.stop_event.wait(VIDEO_INTERVAL)
+
+        if not self.stop_event.is_set():
+            try:
                 self._post(f"/quests/{qid}/video-progress", {"timestamp": needed})
-                self.log(f"Hoàn thành: {name}")
-        except Exception as e:
-            self.log(f"Lỗi video \"{name}\": {e}")
+            except Exception:
+                pass
+            self.log(f"Hoàn thành: {name}")
 
     def _run_heartbeat(self, quest, task_name, task):
         name = self._quest_name(quest)
@@ -441,7 +468,7 @@ class QuestWorker:
         us = self._user_status(quest)
         done = self._progress(us, task_name, quest)
         remaining = max(0, needed - done)
-        self.log(f"[{task_name}] {name}: giả lập (còn ~{remaining // 60} phút)")
+        self.log(f"[{task_name}] {name}: giả lập (còn ~{remaining // 60} phút, chạy song song)")
         fails = 0
         while not self.stop_event.is_set():
             try:
@@ -470,6 +497,7 @@ class QuestWorker:
                     continue
                 fails = 0
                 prog = self._progress(body, task_name, quest)
+                self._set_progress(qid, prog, needed)
                 self.log(f"[{name}] Tiến độ: {prog}/{needed}s")
                 if body.get("completed_at") or prog >= needed:
                     self._post(f"/quests/{qid}/heartbeat", {
@@ -492,7 +520,7 @@ class QuestWorker:
         us = self._user_status(quest)
         done = self._progress(us, task_name, quest)
         remaining = max(0, needed - done)
-        self.log(f"[Activity] {name}: gửi heartbeat (còn ~{remaining // 60} phút)")
+        self.log(f"[Activity] {name}: gửi heartbeat (còn ~{remaining // 60} phút, chạy song song)")
         fails = 0
         while not self.stop_event.is_set():
             try:
@@ -521,6 +549,7 @@ class QuestWorker:
                     continue
                 fails = 0
                 prog = self._progress(body, task_name, quest)
+                self._set_progress(qid, prog, needed)
                 self.log(f"[{name}] Tiến độ: {prog}/{needed}s")
                 if body.get("completed_at") or prog >= needed:
                     self._post(f"/quests/{qid}/heartbeat", {
@@ -658,9 +687,20 @@ def restore_hangs():
     _restored = True
     state = load_json(STATE_FILE)
     for token, info in state.items():
-        stop = submit(_make_event()).result()
-        hangs[token] = {"stop": stop, "started_at": info.get("started_at", time.time())}
-        submit(hang_voice(token, info["guild_id"], info["channel_id"], stop))
+        if not isinstance(info, dict):
+            continue
+        hs = info.get("hangs")
+        if not isinstance(hs, dict):
+            if info.get("guild_id"):
+                hs = {f"{info['guild_id']}:{info['channel_id']}": info}
+            else:
+                hs = {}
+        for key, hin in hs.items():
+            if not isinstance(hin, dict) or not hin.get("guild_id"):
+                continue
+            stop = submit(_make_event()).result()
+            hangs.setdefault(token, {})[key] = {"stop": stop, "started_at": hin.get("started_at", time.time())}
+            submit(hang_voice(token, hin["guild_id"], hin["channel_id"], stop))
     sessions = load_json(SESSIONS_FILE)
     qstate = load_json(QUEST_STATE_FILE)
     for token, info in qstate.items():
@@ -748,16 +788,18 @@ def api_hang():
     if not gid or not cid:
         return jsonify({"ok": False, "error": "Thiếu thông tin server/kênh"}), 400
 
-    old = hangs.pop(token, None)
-    if old:
-        call(old["stop"].set)
+    key = f"{gid}:{cid}"
+    existing = hangs.get(token, {}).get(key)
+    if existing:
+        return jsonify({"ok": True, "started_at": existing["started_at"], "key": key})
 
     started = time.time()
     stop = submit(_make_event()).result()
-    hangs[token] = {"stop": stop, "started_at": started}
+    hangs.setdefault(token, {})[key] = {"stop": stop, "started_at": started}
 
     state = load_json(STATE_FILE)
-    state[token] = {
+    st = state.setdefault(token, {})
+    st.setdefault("hangs", {})[key] = {
         "guild_id": gid,
         "channel_id": cid,
         "guild_name": gname,
@@ -767,7 +809,7 @@ def api_hang():
     save_json(STATE_FILE, state)
 
     submit(hang_voice(token, gid, cid, stop))
-    return jsonify({"ok": True, "started_at": started})
+    return jsonify({"ok": True, "started_at": started, "key": key})
 
 
 @app.route("/api/stop", methods=["POST"])
@@ -775,12 +817,26 @@ def api_stop():
     token, err = require_token()
     if err:
         return err
-    old = hangs.pop(token, None)
-    if old:
-        call(old["stop"].set)
+    data = request.get_json(silent=True) or {}
+    gid = str(data.get("guild_id") or "")
+    cid = str(data.get("channel_id") or "")
     state = load_json(STATE_FILE)
-    state.pop(token, None)
-    save_json(STATE_FILE, state)
+    if gid and cid:
+        key = f"{gid}:{cid}"
+        h = hangs.get(token, {}).pop(key, None)
+        if h:
+            call(h["stop"].set)
+        st = state.get(token)
+        if isinstance(st, dict) and isinstance(st.get("hangs"), dict):
+            st["hangs"].pop(key, None)
+            if not st["hangs"]:
+                state.pop(token, None)
+        save_json(STATE_FILE, state)
+    else:
+        for h in (hangs.pop(token, {}) or {}).values():
+            call(h["stop"].set)
+        state.pop(token, None)
+        save_json(STATE_FILE, state)
     return jsonify({"ok": True})
 
 
@@ -790,19 +846,28 @@ def api_status():
     if err:
         return err
     state = load_json(STATE_FILE)
-    info = state.get(token)
-    hang = None
-    if info:
-        hang = {
-            "guild_id": info["guild_id"],
-            "channel_id": info["channel_id"],
-            "guild_name": info.get("guild_name", ""),
-            "channel_name": info.get("channel_name", ""),
-            "started_at": info.get("started_at", time.time()),
-        }
+    info = state.get(token) or {}
+    hs = info.get("hangs")
+    if not isinstance(hs, dict):
+        if isinstance(info, dict) and info.get("guild_id"):
+            hs = {f"{info['guild_id']}:{info['channel_id']}": info}
+        else:
+            hs = {}
+    hang_list = []
+    for key, hin in hs.items():
+        if not isinstance(hin, dict) or not hin.get("guild_id"):
+            continue
+        hang_list.append({
+            "key": key,
+            "guild_id": hin.get("guild_id"),
+            "channel_id": hin.get("channel_id"),
+            "guild_name": hin.get("guild_name", ""),
+            "channel_name": hin.get("channel_name", ""),
+            "started_at": hin.get("started_at", time.time()),
+        })
     sessions = load_json(SESSIONS_FILE)
     s = sessions.get(token, {})
-    return jsonify({"ok": True, "hang": hang, "user": {
+    return jsonify({"ok": True, "hangs": hang_list, "user": {
         "id": s.get("id", ""),
         "username": s.get("username", ""),
         "avatar": s.get("avatar"),
@@ -826,10 +891,18 @@ def api_quests():
                 quests = (r.json() or {}).get("quests") or []
         except Exception:
             pass
+    summaries = [summarize_quest(q) for q in (quests or [])]
+    if w:
+        with w.lock:
+            prog = {k: dict(v) for k, v in w.progress.items()}
+        for s in summaries:
+            p = prog.get(s["id"])
+            if p and not s["completed"] and s["target"]:
+                s["value"] = max(s["value"], min(s["target"], int(p.get("value") or 0)))
     return jsonify({
         "ok": True,
         "running": bool(w and w.is_alive()),
-        "quests": [summarize_quest(q) for q in (quests or [])],
+        "quests": summaries,
     })
 
 
@@ -887,9 +960,8 @@ def api_logout():
     token, err = require_token()
     if err:
         return err
-    old = hangs.pop(token, None)
-    if old:
-        call(old["stop"].set)
+    for h in (hangs.pop(token, {}) or {}).values():
+        call(h["stop"].set)
     state = load_json(STATE_FILE)
     state.pop(token, None)
     save_json(STATE_FILE, state)

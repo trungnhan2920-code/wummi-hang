@@ -20,9 +20,9 @@
 <!-- ================= LOGIN ================= -->
 <div id="view-login" class="view active">
   <div class="hero">
-    <div class="badge"><span class="pulse-dot"></span>SELFBOT &bull; DISCORD VOICE HANG</div>
+    <div class="badge"><span class="pulse-dot"></span>SELFBOT &bull; VOICE HANG &bull; AUTO QUEST</div>
     <h1 class="title">WUMMI<span class="grad">HANGER</span></h1>
-    <p class="subtitle">Dán token Discord của bạn &mdash; treo voice 24/7, đóng web vẫn giữ kết nối</p>
+    <p class="subtitle">Dán token Discord của bạn &mdash; treo voice nhiều server 24/7 + auto hoàn thành quest, đóng web vẫn giữ kết nối</p>
 
     <div class="login-card glass">
       <label class="field-label" for="token-input">DISCORD TOKEN</label>
@@ -65,17 +65,13 @@
     </section>
 
     <aside class="panel glass hang-panel">
-      <div class="panel-head"><h3>VOICE HANG</h3></div>
+      <div class="panel-head"><h3>VOICE HANG</h3><span id="hang-count" class="count">0</span></div>
       <div class="hang-box">
         <div id="hang-status" class="hang-status idle">Chưa treo kênh nào</div>
-        <div id="hang-channel" class="hang-channel"></div>
-        <div class="timer-box">
-          <div id="timer" class="timer">00:00:00</div>
-          <div class="timer-label">THỜI GIAN TREO</div>
-        </div>
-        <button id="btn-stop" class="btn-danger hidden">Ngừng treo voice</button>
+        <div id="hang-list" class="hang-list"></div>
+        <button id="btn-stop-all" class="btn-danger hidden">Ngừng tất cả voice</button>
       </div>
-      <div class="hang-note">Kết nối chạy trên máy chủ &mdash; bạn có thể đóng web, voice vẫn được giữ.</div>
+      <div class="hang-note">Treo voice nhiều server cùng lúc &mdash; kết nối chạy trên máy chủ, đóng web vẫn giữ. Bấm kênh đang treo để ngừng kênh đó.</div>
     </aside>
 
     <section class="panel glass quest-panel">
@@ -92,7 +88,7 @@
         <span id="quest-running" class="qstate idle">ĐANG TẮT</span>
       </div>
       <div id="quest-log" class="quest-log">Chưa có nhật ký. Bật Auto Quest để bắt đầu.</div>
-      <div class="hang-note">Tự nhận quest và hoàn thành (xem video / chơi game / stream / activity). Tiến độ chạy theo thời gian thực như người xem thật. Không nên chạy khi đang online trên thiết bị khác.</div>
+      <div class="hang-note">Tự nhận quest và hoàn thành (xem video / chơi game / stream / activity). Tất cả quest được chạy <b>song song cùng lúc</b>, tiến độ theo thời gian thực như người xem thật. Không nên chạy khi đang online trên thiết bị khác.</div>
     </section>
   </main>
 </div>
@@ -110,7 +106,7 @@ let TOKEN = localStorage.getItem("wummi_token") || "";
 let USER = null;
 let GUILDS = [];
 let ACTIVE_GUILD = null;
-let HANG = null;
+let HANGS = {}; // key "gid:cid" -> {guild_id, channel_id, guild_name, channel_name, started_at}
 let TIMER_INT = null;
 
 async function api(path, method = "GET", body = null) {
@@ -149,17 +145,54 @@ function showMsg(text, isErr) {
   m.className = "msg " + (isErr ? "err" : "ok");
 }
 
-function startTimer() {
+function fmtDuration(s) {
+  const h = String(Math.floor(s / 3600)).padStart(2, "0");
+  const m = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
+  const sec = String(s % 60).padStart(2, "0");
+  return `${h}:${m}:${sec}`;
+}
+
+function startTimers() {
   clearInterval(TIMER_INT);
-  const tick = () => {
-    const s = Math.max(0, Math.floor((Date.now() - HANG.started_at * 1000) / 1000));
-    const h = String(Math.floor(s / 3600)).padStart(2, "0");
-    const m = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
-    const sec = String(s % 60).padStart(2, "0");
-    $("#timer").textContent = `${h}:${m}:${sec}`;
-  };
+  const tick = () => renderHangPanel();
   tick();
   TIMER_INT = setInterval(tick, 1000);
+}
+
+function renderHangPanel() {
+  const keys = Object.keys(HANGS);
+  const status = $("#hang-status");
+  const box = $("#hang-list");
+  $("#hang-count").textContent = keys.length;
+  if (!keys.length) {
+    status.className = "hang-status idle";
+    status.textContent = "Chưa treo kênh nào";
+    box.innerHTML = "";
+    hidden($("#btn-stop-all"));
+    return;
+  }
+  status.className = "hang-status live";
+  status.textContent = "ĐANG TREO " + keys.length + " KÊNH";
+  shown($("#btn-stop-all"));
+  box.innerHTML = "";
+  for (const key of keys) {
+    const h = HANGS[key];
+    const s = Math.max(0, Math.floor((Date.now() - h.started_at * 1000) / 1000));
+    const el = document.createElement("div");
+    el.className = "hang-item";
+    el.innerHTML = `
+      <div class="hang-item-info">
+        <b>${esc(h.guild_name)} / ${esc(h.channel_name)}</b>
+        <span class="hang-item-time">${fmtDuration(s)}</span>
+      </div>
+      <button class="btn-danger sm">Ngừng</button>`;
+    el.querySelector("button").addEventListener("click", () => stopHang(key));
+    box.appendChild(el);
+  }
+}
+
+function isHanging(gid, cid) {
+  return !!HANGS[`${gid}:${cid}`];
 }
 
 async function doLogin() {
@@ -195,13 +228,11 @@ async function loadDashboard() {
   renderGuilds();
 
   const st = await api("/api/status");
-  if (st.ok && st.hang) {
-    HANG = st.hang;
-    startTimer();
-    $("#hang-status").className = "hang-status live";
-    $("#hang-status").textContent = "ĐANG TREO VOICE";
-    $("#hang-channel").textContent = `${st.hang.guild_name} / ${st.hang.channel_name}`;
-    shown($("#btn-stop"));
+  if (st.ok && st.hangs && st.hangs.length) {
+    HANGS = {};
+    for (const h of st.hangs) HANGS[h.key] = h;
+    startTimers();
+    renderHangPanel();
     toast("Đã nối lại phiên treo voice", "ok");
   }
   refreshQuests();
@@ -250,52 +281,59 @@ async function selectGuild(gid) {
   for (const c of r.channels) {
     const item = document.createElement("div");
     item.className = "chan-item";
-    const isActive = HANG && HANG.channel_id === c.id;
+    const key = `${gid}:${c.id}`;
+    const isActive = isHanging(gid, c.id);
     item.innerHTML = `
       <div class="c-icon">&#128266;</div>
       <div class="c-meta"><b>${esc(c.name)}</b><span>Kênh voice</span></div>
       <button class="btn-join${isActive ? " active" : ""}">${isActive ? "&#10003; Đang treo" : "Treo voice"}</button>`;
-    if (!isActive) {
-      const btn = item.querySelector(".btn-join");
-      btn.addEventListener("click", async () => {
-        btn.disabled = true;
-        btn.textContent = "Đang treo...";
-        const rr = await api("/api/hang", "POST", {
-          guild_id: gid,
-          channel_id: c.id,
-          guild_name: g.name,
-          channel_name: c.name,
-        });
-        btn.disabled = false;
-        if (!rr.ok) {
-          btn.textContent = "Treo voice";
-          return toast(rr.error || "Không thể treo voice", "err");
-        }
-        HANG = { started_at: rr.started_at, channel_id: c.id, channel_name: c.name, guild_name: g.name };
-        startTimer();
-        $("#hang-status").className = "hang-status live";
-        $("#hang-status").textContent = "ĐANG TREO VOICE";
-        $("#hang-channel").textContent = `${g.name} / ${c.name}`;
-        shown($("#btn-stop"));
-        toast(`Đã treo voice vào ${c.name}`, "ok");
-        selectGuild(gid);
+    const btn = item.querySelector(".btn-join");
+    btn.addEventListener("click", async () => {
+      if (isActive) return stopHang(key);
+      btn.disabled = true;
+      btn.textContent = "Đang treo...";
+      const rr = await api("/api/hang", "POST", {
+        guild_id: gid,
+        channel_id: c.id,
+        guild_name: g.name,
+        channel_name: c.name,
       });
-    }
+      btn.disabled = false;
+      if (!rr.ok) {
+        btn.textContent = "Treo voice";
+        return toast(rr.error || "Không thể treo voice", "err");
+      }
+      HANGS[key] = {
+        started_at: rr.started_at,
+        guild_id: gid,
+        channel_id: c.id,
+        guild_name: g.name,
+        channel_name: c.name,
+      };
+      startTimers();
+      toast(`Đã treo voice vào ${c.name}`, "ok");
+      selectGuild(gid);
+    });
     box.appendChild(item);
   }
 }
 
-async function stopHang() {
-  await api("/api/stop", "POST", {});
-  HANG = null;
-  clearInterval(TIMER_INT);
-  $("#timer").textContent = "00:00:00";
-  $("#hang-status").className = "hang-status idle";
-  $("#hang-status").textContent = "Đã ngừng treo";
-  $("#hang-channel").textContent = "";
-  hidden($("#btn-stop"));
+async function stopHang(key) {
+  const h = HANGS[key];
+  if (!h) return;
+  await api("/api/stop", "POST", { guild_id: h.guild_id, channel_id: h.channel_id });
+  delete HANGS[key];
+  renderHangPanel();
   toast("Đã ngừng treo voice", "ok");
-  selectGuild(ACTIVE_GUILD);
+  if (ACTIVE_GUILD) selectGuild(ACTIVE_GUILD);
+}
+
+async function stopAllHangs() {
+  await api("/api/stop", "POST", {});
+  HANGS = {};
+  renderHangPanel();
+  toast("Đã ngừng tất cả voice", "ok");
+  if (ACTIVE_GUILD) selectGuild(ACTIVE_GUILD);
 }
 
 let QUEST_POLL = null;
@@ -415,7 +453,7 @@ function anim() {
   $("#btn-login").addEventListener("click", doLogin);
   $("#token-input").addEventListener("keydown", (e) => { if (e.key === "Enter") doLogin(); });
   $("#btn-logout").addEventListener("click", logout);
-  $("#btn-stop").addEventListener("click", stopHang);
+  $("#btn-stop-all").addEventListener("click", stopAllHangs);
   $("#btn-quest-toggle").addEventListener("click", async () => {
     const btn = $("#btn-quest-toggle");
     btn.disabled = true;
