@@ -226,7 +226,8 @@
         '<span class="hang-item-time">' + fmtDuration(s) + "</span>" +
         "</div>" +
         '<div class="hang-item-actions">' +
-        '<button type="button" class="btn-xa sm' + (isXa ? " active" : "") + '">' +
+        '<button type="button" class="btn-xa sm' + (isXa ? " active" : "") + '"' +
+        (h.xa_stage ? ' title="Xả mic: ' + esc(h.xa_stage) + '"' : "") + ">" +
         (isXa ? "Ngừng xả mic" : "Xả mic") +
         "</button>" +
         '<button type="button" class="btn-danger sm">Ngừng</button>' +

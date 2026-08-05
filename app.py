@@ -25,12 +25,23 @@ app = Flask(__name__)
 
 hangs = {}
 xa_senders = {}  # token -> {key -> {"stop": Event, "started_at": float}}
+xa_debug = {}     # token -> {key -> {"stage": str, "t": float, "err": str}}
 _xa_frames_cache = None
 _loop = None
 _loop_thread = None
 _restored = False
 
 XA_FILE = os.path.join(BASE, "xa.mp3")
+
+
+def xa_log(token, key, msg):
+    try:
+        d = xa_debug.setdefault(token, {}).setdefault(key, {})
+        d["stage"] = msg
+        d["t"] = time.time()
+        print(f"[XAMIC {key}] {msg}", flush=True)
+    except Exception:
+        pass
 
 
 def load_json(path):
@@ -722,27 +733,26 @@ def prepare_xa_frames():
 
 
 async def xa_voice(token, guild_id, channel_id, stop_event):
+    key = f"{guild_id}:{channel_id}"
     frames = prepare_xa_frames()
     if not frames:
+        xa_log(token, key, "LỖI: không decode được xa.mp3 (thiếu file hoặc lib opus)")
         return
-    user_id = ""
+    xa_log(token, key, f"audio sẵn sàng: {len(frames)} khung opus")
     while not stop_event.is_set():
         try:
-            if not user_id:
-                try:
-                    user_id = dapi("GET", "/users/@me", token).json()["id"]
-                except Exception:
-                    pass
-            await _xa_pipeline(token, guild_id, channel_id, stop_event, frames, user_id)
+            await _xa_pipeline(token, guild_id, channel_id, stop_event, frames)
         except asyncio.CancelledError:
             return
-        except Exception:
+        except Exception as e:
             if stop_event.is_set():
                 return
+            xa_log(token, key, f"lỗi vòng lặp: {e}")
             await asyncio.sleep(5)
 
 
-async def _xa_pipeline(token, guild_id, channel_id, stop_event, frames, user_id):
+async def _xa_pipeline(token, guild_id, channel_id, stop_event, frames):
+    key = f"{guild_id}:{channel_id}"
     async with websockets.connect(GATEWAY, max_size=None, ping_interval=None) as ws:
         hello = json.loads(await ws.recv())
         hb = hello["d"]["heartbeat_interval"] / 1000
@@ -765,6 +775,16 @@ async def _xa_pipeline(token, guild_id, channel_id, stop_event, frames, user_id)
                     "intents": 513,
                 },
             }))
+            xa_log(token, key, "gateway: chờ READY")
+            user_id = ""
+            while True:
+                ev = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
+                if ev["op"] == 0 and ev["t"] == "READY":
+                    user_id = ((ev["d"] or {}).get("user") or {}).get("id") or ""
+                    break
+            if not user_id:
+                raise ConnectionError("không lấy được user id từ READY")
+            xa_log(token, key, "gateway: đã READY, gửi voice state (tự bật mic)")
             await ws.send(json.dumps({
                 "op": 4,
                 "d": {
@@ -792,12 +812,13 @@ async def _xa_pipeline(token, guild_id, channel_id, stop_event, frames, user_id)
                         if d.get("guild_id") == guild_id:
                             endpoint = (d.get("endpoint") or "").strip()
                             vtoken = d.get("token")
-            await _xa_voice_session(frames, stop_event, user_id, guild_id, channel_id, session_id, endpoint, vtoken)
+            xa_log(token, key, "gateway: có session_id + endpoint, vào voice server")
+            await _xa_voice_session(token, key, frames, stop_event, user_id, guild_id, channel_id, session_id, endpoint, vtoken)
         finally:
             hb_task.cancel()
 
 
-async def _xa_voice_session(frames, stop_event, user_id, guild_id, channel_id, session_id, endpoint, vtoken):
+async def _xa_voice_session(token, key, frames, stop_event, user_id, guild_id, channel_id, session_id, endpoint, vtoken):
     from nacl.secret import SecretBox
     uri = "wss://" + endpoint + "/?v=4"
     host = endpoint.split(":")[0]
@@ -831,6 +852,7 @@ async def _xa_voice_session(frames, stop_event, user_id, guild_id, channel_id, s
             sock.connect((host, port))
         except OSError:
             pass
+        xa_log(token, key, "voice ws: READY, gửi UDP discovery")
         await loop.sock_sendto(sock, struct.pack(">I", ssrc) + b"\x00" * 66, (host, port))
         data = await loop.sock_recv(sock, 74)
         dip = data[4:68].split(b"\x00")[0].decode(errors="ignore") or host
@@ -852,8 +874,16 @@ async def _xa_voice_session(frames, stop_event, user_id, guild_id, channel_id, s
         nframes = len(frames)
         i = 0
         await ws.send(json.dumps({"op": 5, "d": {"speaking": 1, "delay": 0, "ssrc": ssrc}}))
+        xa_log(token, key, "VOICE ACTIVE: đang phát liên tục (self_mute OFF)")
+        recv_task = asyncio.ensure_future(ws.recv())
         try:
             while not stop_event.is_set():
+                if recv_task.done():
+                    try:
+                        recv_task.result()
+                    except Exception:
+                        raise
+                    raise ConnectionError("voice websocket đóng")
                 hdr = struct.pack(">BBHII", 0x80, 0x78, seq & 0xFFFF, ts & 0xFFFFFFFF, ssrc)
                 if use_crypto:
                     nonce = hdr + b"\x00" * 12
@@ -869,6 +899,7 @@ async def _xa_voice_session(frames, stop_event, user_id, guild_id, channel_id, s
                     break
                 await asyncio.sleep(0.02)
         finally:
+            recv_task.cancel()
             try:
                 await ws.send(json.dumps({"op": 5, "d": {"speaking": 0, "delay": 0, "ssrc": ssrc}}))
             except Exception:
@@ -1036,6 +1067,7 @@ def api_xamic():
             if key in st["hangs"]:
                 st["hangs"][key].pop("xamic", None)
                 save_json(STATE_FILE, state)
+        xa_debug.get(token, {}).pop(key, None)
         return jsonify({"ok": True})
     if key in senders:
         return jsonify({"ok": True})
@@ -1055,6 +1087,14 @@ def api_xamic():
     save_json(STATE_FILE, state)
     submit(xa_voice(token, gid, cid, stop))
     return jsonify({"ok": True})
+
+
+@app.route("/api/xamic/status")
+def api_xamic_status():
+    token, err = require_token()
+    if err:
+        return err
+    return jsonify({"ok": True, "items": xa_debug.get(token, {})})
 
 
 @app.route("/api/stop", methods=["POST"])
@@ -1115,6 +1155,7 @@ def api_status():
             "channel_name": hin.get("channel_name", ""),
             "started_at": hin.get("started_at", time.time()),
             "xamic": bool(hin.get("xamic")),
+            "xa_stage": (xa_debug.get(token, {}).get(key) or {}).get("stage", ""),
         })
     sessions = load_json(SESSIONS_FILE)
     s = sessions.get(token, {})
