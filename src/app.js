@@ -263,7 +263,24 @@
   function startTimers() {
     clearInterval(TIMER_INT);
     renderHangPanel();
-    TIMER_INT = setInterval(renderHangPanel, 1000);
+    TIMER_INT = setInterval(function () {
+      if (Date.now() - (startTimers._lastXaPoll || 0) > 3000) {
+        startTimers._lastXaPoll = Date.now();
+        refreshXaStages();
+      }
+      renderHangPanel();
+    }, 1000);
+  }
+
+  function refreshXaStages() {
+    api("/api/xamic/status").then(function (r) {
+      if (!r.ok || !r.items) return;
+      Object.keys(r.items).forEach(function (k) {
+        var h = HANGS[k];
+        var it = r.items[k];
+        if (h && it && it.stage) h.xa_stage = it.stage;
+      });
+    }).catch(function () {});
   }
 
   function isHanging(gid, cid) {

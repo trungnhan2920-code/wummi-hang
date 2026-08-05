@@ -801,7 +801,10 @@ async def _xa_pipeline(token, guild_id, channel_id, stop_event, frames):
             while session_id is None or endpoint is None:
                 if stop_event.is_set():
                     return
-                ev = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
+                try:
+                    ev = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
+                except asyncio.TimeoutError:
+                    raise ConnectionError("timeout chờ voice event (kênh không vào được / token mất quyền connect?)")
                 if ev["op"] == 0:
                     if ev["t"] == "VOICE_STATE_UPDATE":
                         d = ev["d"]
@@ -837,7 +840,10 @@ async def _xa_voice_session(token, key, frames, stop_event, user_id, guild_id, c
         while ssrc is None:
             if stop_event.is_set():
                 return
-            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
+            try:
+                msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
+            except asyncio.TimeoutError:
+                raise ConnectionError("voice ws timeout chờ READY")
             if msg.get("op") == 2:
                 d = msg["d"]
                 ssrc = d.get("ssrc")
@@ -853,8 +859,14 @@ async def _xa_voice_session(token, key, frames, stop_event, user_id, guild_id, c
         except OSError:
             pass
         xa_log(token, key, "voice ws: READY, gửi UDP discovery")
-        await loop.sock_sendto(sock, struct.pack(">I", ssrc) + b"\x00" * 66, (host, port))
-        data = await loop.sock_recv(sock, 74)
+        try:
+            await loop.sock_sendto(sock, struct.pack(">I", ssrc) + b"\x00" * 66, (host, port))
+            try:
+                data = await asyncio.wait_for(loop.sock_recv(sock, 74), timeout=10)
+            except asyncio.TimeoutError:
+                raise ConnectionError("UDP discovery timeout (UDP outbound bị chặn, ví dụ Render)")
+        except OSError as e:
+            raise ConnectionError(f"UDP discovery lỗi: {e}")
         dip = data[4:68].split(b"\x00")[0].decode(errors="ignore") or host
         dport = struct.unpack(">H", data[68:70])[0] or port
         await ws.send(json.dumps({
@@ -863,7 +875,10 @@ async def _xa_voice_session(token, key, frames, stop_event, user_id, guild_id, c
         }))
         secret = None
         while secret is None:
-            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
+            try:
+                msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
+            except asyncio.TimeoutError:
+                raise ConnectionError("voice ws timeout chờ SESSION_DESCRIPTION")
             if msg.get("op") == 4:
                 secret = bytes(msg["d"]["secret_key"])
         await ws.send(json.dumps({"op": 3, "d": None}))
