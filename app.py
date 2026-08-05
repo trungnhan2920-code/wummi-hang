@@ -4,8 +4,11 @@ import json
 import os
 import random
 import re
+<<<<<<< HEAD
 import socket
 import struct
+=======
+>>>>>>> a4797d1fe4e9a7b35863750385db27766e9fa473
 import threading
 import time
 from collections import deque
@@ -18,20 +21,29 @@ from flask import Flask, jsonify, request, send_from_directory
 BASE = os.path.dirname(os.path.abspath(__file__))
 SESSIONS_FILE = os.path.join(BASE, "sessions.json")
 STATE_FILE = os.path.join(BASE, "state.json")
+<<<<<<< HEAD
 ASSETS = os.path.join(BASE, "assets")
+=======
+>>>>>>> a4797d1fe4e9a7b35863750385db27766e9fa473
 GATEWAY = "wss://gateway.discord.gg/?v=9&encoding=json"
 
 app = Flask(__name__)
 
 hangs = {}
+<<<<<<< HEAD
 xa_senders = {}  # token -> {key -> {"stop": Event, "started_at": float}}
 _xa_frames_cache = None
+=======
+>>>>>>> a4797d1fe4e9a7b35863750385db27766e9fa473
 _loop = None
 _loop_thread = None
 _restored = False
 
+<<<<<<< HEAD
 XA_FILE = os.path.join(BASE, "xa.mp3")
 
+=======
+>>>>>>> a4797d1fe4e9a7b35863750385db27766e9fa473
 
 def load_json(path):
     try:
@@ -686,6 +698,7 @@ async def hang_voice(token, guild_id, channel_id, stop_event):
             await asyncio.sleep(5)
 
 
+<<<<<<< HEAD
 # ================= XẢ MIC (phát âm thanh vào kênh voice, lặp vô hạn) =================
 
 def prepare_xa_frames():
@@ -876,6 +889,8 @@ async def _xa_voice_session(frames, stop_event, user_id, guild_id, channel_id, s
             sock.close()
 
 
+=======
+>>>>>>> a4797d1fe4e9a7b35863750385db27766e9fa473
 @app.before_request
 def restore_hangs():
     global _restored
@@ -898,10 +913,13 @@ def restore_hangs():
             stop = submit(_make_event()).result()
             hangs.setdefault(token, {})[key] = {"stop": stop, "started_at": hin.get("started_at", time.time())}
             submit(hang_voice(token, hin["guild_id"], hin["channel_id"], stop))
+<<<<<<< HEAD
             if hin.get("xamic"):
                 xstop = submit(_make_event()).result()
                 xa_senders.setdefault(token, {})[key] = {"stop": xstop, "started_at": time.time()}
                 submit(xa_voice(token, hin["guild_id"], hin["channel_id"], xstop))
+=======
+>>>>>>> a4797d1fe4e9a7b35863750385db27766e9fa473
     sessions = load_json(SESSIONS_FILE)
     qstate = load_json(QUEST_STATE_FILE)
     for token, info in qstate.items():
@@ -1013,6 +1031,7 @@ def api_hang():
     return jsonify({"ok": True, "started_at": started, "key": key})
 
 
+<<<<<<< HEAD
 @app.route("/api/xamic", methods=["POST"])
 def api_xamic():
     token, err = require_token()
@@ -1057,6 +1076,8 @@ def api_xamic():
     return jsonify({"ok": True})
 
 
+=======
+>>>>>>> a4797d1fe4e9a7b35863750385db27766e9fa473
 @app.route("/api/stop", methods=["POST"])
 def api_stop():
     token, err = require_token()
@@ -1071,9 +1092,12 @@ def api_stop():
         h = hangs.get(token, {}).pop(key, None)
         if h:
             call(h["stop"].set)
+<<<<<<< HEAD
         x = xa_senders.get(token, {}).pop(key, None)
         if x:
             call(x["stop"].set)
+=======
+>>>>>>> a4797d1fe4e9a7b35863750385db27766e9fa473
         st = state.get(token)
         if isinstance(st, dict) and isinstance(st.get("hangs"), dict):
             st["hangs"].pop(key, None)
@@ -1083,8 +1107,11 @@ def api_stop():
     else:
         for h in (hangs.pop(token, {}) or {}).values():
             call(h["stop"].set)
+<<<<<<< HEAD
         for x in (xa_senders.pop(token, {}) or {}).values():
             call(x["stop"].set)
+=======
+>>>>>>> a4797d1fe4e9a7b35863750385db27766e9fa473
         state.pop(token, None)
         save_json(STATE_FILE, state)
     return jsonify({"ok": True})
@@ -1114,7 +1141,10 @@ def api_status():
             "guild_name": hin.get("guild_name", ""),
             "channel_name": hin.get("channel_name", ""),
             "started_at": hin.get("started_at", time.time()),
+<<<<<<< HEAD
             "xamic": bool(hin.get("xamic")),
+=======
+>>>>>>> a4797d1fe4e9a7b35863750385db27766e9fa473
         })
     sessions = load_json(SESSIONS_FILE)
     s = sessions.get(token, {})
@@ -1213,8 +1243,11 @@ def api_logout():
         return err
     for h in (hangs.pop(token, {}) or {}).values():
         call(h["stop"].set)
+<<<<<<< HEAD
     for x in (xa_senders.pop(token, {}) or {}).values():
         call(x["stop"].set)
+=======
+>>>>>>> a4797d1fe4e9a7b35863750385db27766e9fa473
     state = load_json(STATE_FILE)
     state.pop(token, None)
     save_json(STATE_FILE, state)
@@ -1230,6 +1263,7 @@ def api_logout():
     return jsonify({"ok": True})
 
 
+<<<<<<< HEAD
 @app.after_request
 def secure_headers(resp):
     resp.headers["X-Content-Type-Options"] = "nosniff"
@@ -1239,11 +1273,14 @@ def secure_headers(resp):
     return resp
 
 
+=======
+>>>>>>> a4797d1fe4e9a7b35863750385db27766e9fa473
 @app.route("/")
 def index():
     return send_from_directory(BASE, "index.html")
 
 
+<<<<<<< HEAD
 @app.route("/assets/<path:name>")
 def assets(name):
     if ".." in name or name.startswith(".") or "\\" in name:
@@ -1251,6 +1288,8 @@ def assets(name):
     return send_from_directory(ASSETS, name)
 
 
+=======
+>>>>>>> a4797d1fe4e9a7b35863750385db27766e9fa473
 @app.route("/ping")
 def ping():
     return jsonify({"ok": True, "time": int(time.time())})
@@ -1258,7 +1297,11 @@ def ping():
 
 @app.route("/style.css")
 def css():
+<<<<<<< HEAD
     return send_from_directory(ASSETS, "style.min.css")
+=======
+    return send_from_directory(BASE, "style.css")
+>>>>>>> a4797d1fe4e9a7b35863750385db27766e9fa473
 
 
 if __name__ == "__main__":
