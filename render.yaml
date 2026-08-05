@@ -5,7 +5,7 @@ services:
     plan: free
     autoDeploy: true
     healthCheckPath: /ping
-    buildCommand: pip install -r requirements.txt
+    buildCommand: apt-get update && apt-get install -y libopus0 libopusfile0 libogg0 && pip install -r requirements.txt
     startCommand: python app.py
     envVars:
       - key: PYTHON_VERSION
