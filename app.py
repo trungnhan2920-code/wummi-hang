@@ -625,6 +625,8 @@ def require_token():
 
 
 async def hang_voice(token, guild_id, channel_id, stop_event):
+    key = f"{guild_id}:{channel_id}"
+    frames = prepare_xa_frames()
     while not stop_event.is_set():
         try:
             async with websockets.connect(GATEWAY, max_size=None, ping_interval=None) as ws:
@@ -649,51 +651,102 @@ async def hang_voice(token, guild_id, channel_id, stop_event):
                             "intents": 513,
                         },
                     }))
-
+                    user_id = ""
                     while True:
-                        ev = json.loads(await ws.recv())
+                        ev = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
                         if ev["op"] == 0 and ev["t"] == "READY":
+                            user_id = ((ev["d"] or {}).get("user") or {}).get("id") or ""
                             break
-
-                    await ws.send(json.dumps({
-                        "op": 4,
-                        "d": {
-                            "guild_id": guild_id,
-                            "channel_id": channel_id,
-                            "self_mute": True,
-                            "self_deaf": False,
-                            "self_video": True,
-                        },
-                    }))
-
-                    stop_task = asyncio.create_task(stop_event.wait())
-                    while True:
-                        recv_task = asyncio.create_task(ws.recv())
-                        done, _ = await asyncio.wait(
-                            {stop_task, recv_task}, return_when=asyncio.FIRST_COMPLETED
-                        )
-                        if stop_task in done:
-                            recv_task.cancel()
-                            try:
-                                await ws.send(json.dumps({
-                                    "op": 4,
-                                    "d": {
-                                        "guild_id": guild_id,
-                                        "channel_id": None,
-                                        "self_mute": False,
-                                        "self_deaf": False,
-                                        "self_video": False,
-                                    },
-                                }))
-                            except Exception:
-                                pass
+                    await _op4_voice(ws, guild_id, channel_id, mute=not xa_is_on(token, key))
+                    session_id = None
+                    endpoint = None
+                    vtoken = None
+                    while session_id is None or endpoint is None:
+                        if stop_event.is_set():
                             return
-                        recv_task.result()
+                        try:
+                            ev = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
+                        except asyncio.TimeoutError:
+                            raise ConnectionError("timeout chờ voice event (kênh không vào được / mất quyền connect?)")
+                        if ev["op"] == 0:
+                            if ev["t"] == "VOICE_STATE_UPDATE":
+                                d = ev["d"]
+                                if d.get("guild_id") == guild_id and d.get("channel_id") == channel_id:
+                                    session_id = d.get("session_id")
+                            elif ev["t"] == "VOICE_SERVER_UPDATE":
+                                d = ev["d"]
+                                if d.get("guild_id") == guild_id:
+                                    endpoint = (d.get("endpoint") or "").strip()
+                                    vtoken = d.get("token")
+                    vctx = None
+                    try:
+                        vctx = await _voice_handshake(token, key, guild_id, channel_id, session_id, endpoint, vtoken, user_id)
+                    except Exception as e:
+                        xa_log(token, key, f"voice server không khả dụng: {e} (hang vẫn chạy, xả mic cần UDP)")
+                    if vctx:
+                        xa_log(token, key, "voice server đã kết nối (mic đang mute)")
+                    stop_task = asyncio.create_task(stop_event.wait())
+                    recv_task = asyncio.ensure_future(ws.recv())
+                    prev_on = None
+                    try:
+                        while True:
+                            if stop_task.done():
+                                break
+                            if recv_task.done():
+                                try:
+                                    recv_task.result()
+                                except Exception:
+                                    break
+                                recv_task = asyncio.ensure_future(ws.recv())
+                            on = xa_is_on(token, key)
+                            if on != prev_on:
+                                if on and not vctx:
+                                    xa_log(token, key, "XẢ MIC BẬT nhưng voice server không kết nối được (UDP bị chặn?)")
+                                await _op4_voice(ws, guild_id, channel_id, mute=not on)
+                                prev_on = on
+                                xa_log(token, key,
+                                    "XẢ MIC: mic đang MỞ, phát âm thanh liên tục" if on
+                                    else "Xả mic tắt: mic đã mute, vẫn treo voice")
+                            if on and vctx and frames:
+                                try:
+                                    await _xa_send_frame(vctx, frames)
+                                except OSError:
+                                    raise
+                                await asyncio.sleep(0.02)
+                            else:
+                                await asyncio.sleep(0.5)
+                    finally:
+                        try:
+                            if vctx:
+                                await vctx["ws"].send(json.dumps({
+                                    "op": 5, "d": {"speaking": 0, "delay": 0, "ssrc": vctx["ssrc"]},
+                                }))
+                                vctx["sock"].close()
+                                await vctx["ws"].close()
+                        except Exception:
+                            pass
+                        recv_task.cancel()
+                        try:
+                            await ws.send(json.dumps({
+                                "op": 4,
+                                "d": {
+                                    "guild_id": guild_id,
+                                    "channel_id": None,
+                                    "self_mute": False,
+                                    "self_deaf": False,
+                                    "self_video": False,
+                                },
+                            }))
+                        except Exception:
+                            pass
                 finally:
                     hb_task.cancel()
-        except Exception:
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
             if stop_event.is_set():
                 return
+            xa_log(token, key, f"hang lỗi: {e}")
             await asyncio.sleep(5)
 
 
@@ -732,101 +785,33 @@ def prepare_xa_frames():
         return None
 
 
-async def xa_voice(token, guild_id, channel_id, stop_event):
-    key = f"{guild_id}:{channel_id}"
-    frames = prepare_xa_frames()
-    if not frames:
-        xa_log(token, key, "LỖI: không decode được xa.mp3 (thiếu file hoặc lib opus)")
-        return
-    xa_log(token, key, f"audio sẵn sàng: {len(frames)} khung opus")
-    while not stop_event.is_set():
-        try:
-            await _xa_pipeline(token, guild_id, channel_id, stop_event, frames)
-        except asyncio.CancelledError:
-            return
-        except Exception as e:
-            if stop_event.is_set():
-                return
-            xa_log(token, key, f"lỗi vòng lặp: {e}")
-            await asyncio.sleep(5)
+xa_state = {}  # token -> key -> True (xả mic đang bật)
 
 
-async def _xa_pipeline(token, guild_id, channel_id, stop_event, frames):
-    key = f"{guild_id}:{channel_id}"
-    async with websockets.connect(GATEWAY, max_size=None, ping_interval=None) as ws:
-        hello = json.loads(await ws.recv())
-        hb = hello["d"]["heartbeat_interval"] / 1000
-
-        async def heartbeat():
-            try:
-                while True:
-                    await asyncio.sleep(hb)
-                    await ws.send(json.dumps({"op": 1, "d": None}))
-            except Exception:
-                return
-
-        hb_task = asyncio.create_task(heartbeat())
-        try:
-            await ws.send(json.dumps({
-                "op": 2,
-                "d": {
-                    "token": token,
-                    "properties": {"$os": "windows", "$browser": "chrome", "$device": "pc"},
-                    "intents": 513,
-                },
-            }))
-            xa_log(token, key, "gateway: chờ READY")
-            user_id = ""
-            while True:
-                ev = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
-                if ev["op"] == 0 and ev["t"] == "READY":
-                    user_id = ((ev["d"] or {}).get("user") or {}).get("id") or ""
-                    break
-            if not user_id:
-                raise ConnectionError("không lấy được user id từ READY")
-            xa_log(token, key, "gateway: đã READY, gửi voice state (tự bật mic)")
-            await ws.send(json.dumps({
-                "op": 4,
-                "d": {
-                    "guild_id": guild_id,
-                    "channel_id": channel_id,
-                    "self_mute": False,
-                    "self_deaf": False,
-                    "self_video": False,
-                },
-            }))
-            session_id = None
-            endpoint = None
-            vtoken = None
-            while session_id is None or endpoint is None:
-                if stop_event.is_set():
-                    return
-                try:
-                    ev = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
-                except asyncio.TimeoutError:
-                    raise ConnectionError("timeout chờ voice event (kênh không vào được / token mất quyền connect?)")
-                if ev["op"] == 0:
-                    if ev["t"] == "VOICE_STATE_UPDATE":
-                        d = ev["d"]
-                        if d.get("guild_id") == guild_id and d.get("channel_id") == channel_id:
-                            session_id = d.get("session_id")
-                    elif ev["t"] == "VOICE_SERVER_UPDATE":
-                        d = ev["d"]
-                        if d.get("guild_id") == guild_id:
-                            endpoint = (d.get("endpoint") or "").strip()
-                            vtoken = d.get("token")
-            xa_log(token, key, "gateway: có session_id + endpoint, vào voice server")
-            await _xa_voice_session(token, key, frames, stop_event, user_id, guild_id, channel_id, session_id, endpoint, vtoken)
-        finally:
-            hb_task.cancel()
+def xa_is_on(token, key):
+    return bool((xa_state.get(token) or {}).get(key))
 
 
-async def _xa_voice_session(token, key, frames, stop_event, user_id, guild_id, channel_id, session_id, endpoint, vtoken):
+def _op4_voice(ws, guild_id, channel_id, mute):
+    return ws.send(json.dumps({
+        "op": 4,
+        "d": {
+            "guild_id": guild_id,
+            "channel_id": channel_id,
+            "self_mute": mute,
+            "self_deaf": False,
+            "self_video": True,
+        },
+    }))
+
+
+async def _voice_handshake(token, key, guild_id, channel_id, session_id, endpoint, vtoken, user_id):
     from nacl.secret import SecretBox
     uri = "wss://" + endpoint + "/?v=4"
     host = endpoint.split(":")[0]
     loop = asyncio.get_event_loop()
-    async with websockets.connect(uri, max_size=None, ping_interval=None) as ws:
+    ws = await websockets.connect(uri, max_size=None, ping_interval=None)
+    try:
         await ws.send(json.dumps({
             "op": 0,
             "d": {
@@ -838,8 +823,6 @@ async def _xa_voice_session(token, key, frames, stop_event, user_id, guild_id, c
         }))
         ssrc = port = mode = None
         while ssrc is None:
-            if stop_event.is_set():
-                return
             try:
                 msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
             except asyncio.TimeoutError:
@@ -851,7 +834,7 @@ async def _xa_voice_session(token, key, frames, stop_event, user_id, guild_id, c
                 modes = d.get("modes") or []
                 mode = "xsalsa20_poly1305" if "xsalsa20_poly1305" in modes else (modes[0] if modes else "plain")
             elif msg.get("op") == 8:
-                raise ConnectionError("voice websocket closed")
+                raise ConnectionError("voice websocket đóng")
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setblocking(False)
         try:
@@ -882,44 +865,39 @@ async def _xa_voice_session(token, key, frames, stop_event, user_id, guild_id, c
             if msg.get("op") == 4:
                 secret = bytes(msg["d"]["secret_key"])
         await ws.send(json.dumps({"op": 3, "d": None}))
-        use_crypto = mode.startswith("xsalsa")
-        box = SecretBox(secret) if use_crypto else None
-        seq = random.randrange(0, 65536)
-        ts = random.randrange(0, 2 ** 32)
-        nframes = len(frames)
-        i = 0
-        await ws.send(json.dumps({"op": 5, "d": {"speaking": 1, "delay": 0, "ssrc": ssrc}}))
-        xa_log(token, key, "VOICE ACTIVE: đang phát liên tục (self_mute OFF)")
-        recv_task = asyncio.ensure_future(ws.recv())
+        return {
+            "ws": ws,
+            "sock": sock,
+            "host": host,
+            "port": port,
+            "use_crypto": mode.startswith("xsalsa"),
+            "box": SecretBox(secret) if mode.startswith("xsalsa") else None,
+            "ssrc": ssrc,
+            "seq": random.randrange(0, 65536),
+            "ts": random.randrange(0, 2 ** 32),
+            "fi": 0,
+            "loop": loop,
+        }
+    except Exception:
         try:
-            while not stop_event.is_set():
-                if recv_task.done():
-                    try:
-                        recv_task.result()
-                    except Exception:
-                        raise
-                    raise ConnectionError("voice websocket đóng")
-                hdr = struct.pack(">BBHII", 0x80, 0x78, seq & 0xFFFF, ts & 0xFFFFFFFF, ssrc)
-                if use_crypto:
-                    nonce = hdr + b"\x00" * 12
-                    pkt = hdr + box.encrypt(frames[i % nframes], nonce)[24:]
-                else:
-                    pkt = hdr + frames[i % nframes]
-                seq = (seq + 1) & 0xFFFF
-                ts = (ts + 960) & 0xFFFFFFFF
-                i += 1
-                try:
-                    await loop.sock_sendto(sock, pkt, (host, port))
-                except OSError:
-                    break
-                await asyncio.sleep(0.02)
-        finally:
-            recv_task.cancel()
-            try:
-                await ws.send(json.dumps({"op": 5, "d": {"speaking": 0, "delay": 0, "ssrc": ssrc}}))
-            except Exception:
-                pass
-            sock.close()
+            await ws.close()
+        except Exception:
+            pass
+        raise
+
+
+async def _xa_send_frame(vctx, frames):
+    hdr = struct.pack(">BBHII", 0x80, 0x78, vctx["seq"] & 0xFFFF, vctx["ts"] & 0xFFFFFFFF, vctx["ssrc"])
+    if vctx["use_crypto"]:
+        nonce = hdr + b"\x00" * 12
+        pkt = hdr + vctx["box"].encrypt(frames[vctx["fi"] % len(frames)], nonce)[24:]
+    else:
+        pkt = hdr + frames[vctx["fi"] % len(frames)]
+    vctx["seq"] = (vctx["seq"] + 1) & 0xFFFF
+    vctx["ts"] = (vctx["ts"] + 960) & 0xFFFFFFFF
+    vctx["fi"] += 1
+    await vctx["loop"].sock_sendto(vctx["sock"], pkt, (vctx["host"], vctx["port"]))
+    return vctx
 
 
 @app.before_request
@@ -945,9 +923,7 @@ def restore_hangs():
             hangs.setdefault(token, {})[key] = {"stop": stop, "started_at": hin.get("started_at", time.time())}
             submit(hang_voice(token, hin["guild_id"], hin["channel_id"], stop))
             if hin.get("xamic"):
-                xstop = submit(_make_event()).result()
-                xa_senders.setdefault(token, {})[key] = {"stop": xstop, "started_at": time.time()}
-                submit(xa_voice(token, hin["guild_id"], hin["channel_id"], xstop))
+                xa_state.setdefault(token, {})[key] = True
     sessions = load_json(SESSIONS_FILE)
     qstate = load_json(QUEST_STATE_FILE)
     for token, info in qstate.items():
@@ -1071,11 +1047,8 @@ def api_xamic():
     if not gid or not cid:
         return jsonify({"ok": False, "error": "Thiếu thông tin server/kênh"}), 400
     key = f"{gid}:{cid}"
-    senders = xa_senders.setdefault(token, {})
     if action == "stop":
-        s = senders.pop(key, None)
-        if s:
-            call(s["stop"].set)
+        (xa_state.get(token) or {}).pop(key, None)
         state = load_json(STATE_FILE)
         st = state.get(token)
         if isinstance(st, dict) and isinstance(st.get("hangs"), dict):
@@ -1084,10 +1057,9 @@ def api_xamic():
                 save_json(STATE_FILE, state)
         xa_debug.get(token, {}).pop(key, None)
         return jsonify({"ok": True})
-    if key in senders:
+    if xa_is_on(token, key):
         return jsonify({"ok": True})
-    stop = submit(_make_event()).result()
-    senders[key] = {"stop": stop, "started_at": time.time()}
+    xa_state.setdefault(token, {})[key] = True
     state = load_json(STATE_FILE)
     st = state.setdefault(token, {}).setdefault("hangs", {})
     if key not in st:
@@ -1100,7 +1072,7 @@ def api_xamic():
         }
     st[key]["xamic"] = True
     save_json(STATE_FILE, state)
-    submit(xa_voice(token, gid, cid, stop))
+    xa_log(token, key, "đã bật xả mic, chờ hang áp dụng (mic tự mở + phát liên tục)")
     return jsonify({"ok": True})
 
 
@@ -1126,9 +1098,7 @@ def api_stop():
         h = hangs.get(token, {}).pop(key, None)
         if h:
             call(h["stop"].set)
-        x = xa_senders.get(token, {}).pop(key, None)
-        if x:
-            call(x["stop"].set)
+        (xa_state.get(token) or {}).pop(key, None)
         st = state.get(token)
         if isinstance(st, dict) and isinstance(st.get("hangs"), dict):
             st["hangs"].pop(key, None)
@@ -1138,8 +1108,7 @@ def api_stop():
     else:
         for h in (hangs.pop(token, {}) or {}).values():
             call(h["stop"].set)
-        for x in (xa_senders.pop(token, {}) or {}).values():
-            call(x["stop"].set)
+        xa_state.pop(token, None)
         state.pop(token, None)
         save_json(STATE_FILE, state)
     return jsonify({"ok": True})
@@ -1269,8 +1238,7 @@ def api_logout():
         return err
     for h in (hangs.pop(token, {}) or {}).values():
         call(h["stop"].set)
-    for x in (xa_senders.pop(token, {}) or {}).values():
-        call(x["stop"].set)
+    xa_state.pop(token, None)
     state = load_json(STATE_FILE)
     state.pop(token, None)
     save_json(STATE_FILE, state)
