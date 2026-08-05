@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex, nofollow">
+<title>WUMMI HANGER</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎧</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700;800&family=Orbitron:wght@500;700;900&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/assets/style.min.css">
+</head>
+<body>
+
+<canvas id="bg"></canvas>
+<div class="orb orb-1"></div>
+<div class="orb orb-2"></div>
+<div class="orb orb-3"></div>
+
+<div id="view-login" class="view active">
+  <div class="hero">
+    <div class="badge"><span class="pulse-dot"></span>SELFBOT &bull; VOICE HANG &bull; AUTO QUEST</div>
+    <h1 class="title">WUMMI<span class="grad">HANGER</span></h1>
+    <p class="subtitle">Dán token Discord &mdash; treo voice nhiều server 24/7 + auto hoàn thành quest. Đóng web vẫn giữ kết nối.</p>
+
+    <div class="login-card glass">
+      <label class="field-label" for="token-input">DISCORD TOKEN</label>
+      <div class="input-row">
+        <input id="token-input" type="password" placeholder="Nhập token Discord..." autocomplete="off" spellcheck="false">
+        <button id="btn-login" class="btn-primary">Kết nối <span class="btn-arrow">&rarr;</span></button>
+      </div>
+      <div id="login-msg" class="msg"></div>
+      <div class="login-meta">
+        <span class="mini-dot"></span> Máy chủ luôn bật &bull; Giữ kết nối kể cả khi đóng web
+      </div>
+    </div>
+
+    <div class="clock-card glass">
+      <div class="clock-label">SERVER TIME</div>
+      <div id="clock" class="clock">00:00:00</div>
+      <div id="date" class="date"></div>
+    </div>
+  </div>
+  <footer class="foot">Powered by <b>PhLong</b> &bull; wummi.site.je</footer>
+</div>
+
+<div id="view-dash" class="view"></div>
+<div id="toast" class="toast"></div>
+<script src="/assets/app.min.js"></script>
+</body>
+</html>
